@@ -137,7 +137,7 @@ def configuration(plan):
         datasets=plan['datasets'],credentials_path=plan['credentials'],rg_binary=plan['rg_binary'],
         algorithm={'name':'RISE' if structured else 'RISE-BM25','structured_docs':structured,'bm25_k':1000,'k1':1.5,'b':0.75,
                    'top_preview':10,'snippet_chars':100,'bash_chars':4000,'bash_timeout':60,
-                   'read_default_lines':2000,'read_line_chars':2000,'max_turns':100,
+                   'read_default_lines':2000,'read_line_chars':2000,'max_turns':50,
                    'wall_clock_seconds':3600,'coerce_final':coerce_final,'context_level':'level0',
                    'assistant_reasoning_history':'preserved','reasoning_trace':'preserved'},
         api={'reasoning_controls':'omitted','qa':{'max_tokens':32000,'temperature':0.0,'outer_attempts':3},
@@ -380,7 +380,7 @@ def qa_one(item):
     functions={name:wrap(name,fn) for name,fn in functions.items()}
     coerce_final=c.config['algorithm']['coerce_final']
     structured=c.config['algorithm'].get('structured_docs',True)
-    config=for_rise(agent_model=MODEL,max_model_calls=100,coerce_final_on_max_turns=coerce_final,structured_doc_mode=structured,
+    config=for_rise(agent_model=MODEL,max_model_calls=c.config['algorithm']['max_turns'],coerce_final_on_max_turns=coerce_final,structured_doc_mode=structured,
                     bm25_k=1000,reasoning_effort='omitted_user_override')
     agent=Agent(client=client,model=MODEL,tools=functions,
                 tool_specs=[bm25_search_tool_spec(),bash_tool_spec(),read_tool_spec()],
