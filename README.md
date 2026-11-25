@@ -119,6 +119,44 @@ nohup .venv/bin/python -u -B adapters/experiment/launch.py --plan plans/enterpri
 
 读取 `runs/<run>/ingestion_timing_v2.json` 的 `total_ingestion_seconds`：重新生成 Parquet＋构建 BM25，不覆盖正式索引，并核对新旧产物和检索结果。不计下载、输入副本、预检与校验时间；不清空 OS 缓存。入库 API token 为 0。模型生成具有随机性，耗时也受服务负载和硬件影响。
 
+## RSI 最小实验闭环
+
+`adapters/rsi/run.py` 提供一个持续负责分析、诊断、修复和复盘的优化 agent：查询原始事实 → 标注证据要求 → 保存机制诊断 → 比较成本与风险 → 提交代码 → 配对验证 → 接受或拒绝。没有预装优化措施，不修改当前工作树；所有候选保存在独立目录。第一版逐项验证，不做多 agent、候选组合或前缀续跑。
+
+两项方法对应四个工具，而不是四个独立 agent：
+
+| 方法 | 代码与 agent 接口 | 约束 |
+| --- | --- | --- |
+| **可查询、可核验的证据反馈** | `feedback.py` 的 `query`、`annotate`；按需读取题目、原始事件、文档、证据状态 | 原文哈希和区间由程序核验；充分性、覆盖范围和必要性仍是模型判断，不升级为事实 |
+| **证据约束下的成本归因与选择** | `feedback.py` 的 `cost`、`diagnose`，`run.py` 的诊断比较和 `submit` | 先登记依据与机制，再选择改动；程序核验成本范围，agent 判断优先级，最后用实测而非估计负担决定接受 |
+
+`prompts.py` 保存统一提示词与工具 schema，不包含已知有效的具体优化配方。`diagnose` 必填观察、假设、反证、未知项、预期可观测变化、风险，以及每题的原始引用、相关请求、内容 ID 和必要性判断。`query(kind="diagnoses")` 并列展示影响范围、相关请求实际 Token、所选内容携带量、必要性判断、共同开发集的验证成本参考及历史实测结果；不把相关成本自动当成收益分数。`submit` 必须引用当前版本的诊断并说明选择理由；标注变化后须重新诊断。验证返回开发题逐题得分／Token 变化和本候选验证投入，失败候选的开发轨迹也可用 `version` 查询、标注和复盘。
+
+**前提**：已有当前代码和依赖版本下完成评分的基线 campaign，保留 prepared 数据、`corpus.parquet` 和完整 trace。准备一个 JSON 划分文件，包含非空的 `dev`、`selection`、`test` 三个题号数组，恰好覆盖基线计划的全部题目；可增加 `groups`（题号到事件组的映射）。程序拒绝题号重叠、相同问题、共享标注来源或显式事件组跨集合；未标注的事件关联仍需人工检查。人工深入分析过的问题应归入开发集，建议先用 20–30 道开发题。
+
+```bash
+# 离线初始化：复用原始基线结果，不调用 API。
+.venv/bin/python -B adapters/rsi/run.py init \
+  --plan plans/enterprise_511959_500qa.json --split plans/rsi_split.json \
+  --out runs/rsi_pilot --max-candidates 3 --max-total-tokens 5000000
+
+# 离线检查开发题反馈；其他查询为 case/event/source/evidence/cost/code/diagnoses。
+.venv/bin/python -B adapters/rsi/run.py query --root runs/rsi_pilot --kind cases
+
+# 以下两条均会真实调用 API；仅在 Linux + bubblewrap 环境执行。
+.venv/bin/python -B adapters/rsi/run.py run --root runs/rsi_pilot --execute
+.venv/bin/python -B adapters/rsi/run.py test --root runs/rsi_pilot --execute
+```
+
+- **模型与编辑范围**：问答及 judge 继续使用原基线模型。初始化时用 `--optimizer-model` 和 `--optimizer-response-model` 单独指定优化模型；默认与基线相同，不自动调用强模型。可修改 `agent.py`、`tools.py`、`rise_agent.py`、`retrieval.py`；评分器、预算配置、日志和 RSI 控制器不开放编辑。适配器中固定的参数不属于本版编辑范围。
+- **证据与成本**：查询分页返回原文；标注核验唯一原文片段及哈希，区分替代来源和联合支持。S1–S4 是从工作区及实际请求得到的保守观测，不能将未匹配到原文等同于事实不存在；充分性和采纳需要语义判断。逐请求记录实际 usage、事实可见变化与各项要求的状态驻留成本；不同要求的驻留账重叠，不能相加。携带账记录工具操作、首末可见请求、命中片段及物理重复，包含重试；不强行关联无法对应的工具事件。`cl100k_base` 仅作 Token 估计，不冒充 DeepSeek 账单，缺失 tokenizer 时只报告字符量。携带范围仅覆盖工具消息，不能代替整题成本；命中或未命中标注都不能自动证明内容的必要性。
+- **验证与接受**：每项候选先做语法检查，再调用既有真实预检和 QA 执行器；开发集全体问题作为共同对照，达标后才跑选择集。默认质量均值不得低于最初基线，Token 比当前版本至少降低 5%；这是小规模试运行的点估计门槛，不是统计非劣性结论。选择集仅返回聚合结果；测试单独在冻结后启动。
+- **隔离**：候选 Python 在外层 bubblewrap 中运行，仅挂载代码、去除 gold/证据/metadata 的本阶段问题、只读语料、索引、输出及 API 凭据。真实评分在宿主执行，评分日志不挂载给候选，内部 bash 继续使用原沙箱。跨挂载点无法硬链接时，仅对召回文件做字节一致的复制；这会增加文件 I/O，延迟不能视为与原基线完全同环境。网络为 API 保留；这不是对恶意 Python 的完备安全审计，仍应检查候选代码有无硬编码或评估特判。
+- **预算与恢复**：默认最多 30 次优化请求、3 项候选，连续两项未接受即停止。总 Token 阈值在请求和评估阶段之间检查，不会中断正在运行的阶段，因此可能超出一个阶段的费用；请给最终测试预留额度。失败请求没有 usage 时记为未知并停止，不按零计费；不自动重抽答错题。用相同命令恢复，签名漂移会拒绝，失败现场和 `.building` 不自动清理。
+- **产物**：`diagnoses/` 保存冻结的机制诊断、引用哈希、标注快照及成本范围；`versions/*/proposal.json`、`decision.json` 和隔离代码保存候选、选择理由、配对结果与验证投入；`annotations/` 保留标注版本；`evaluations/` 保存运行、宿主评分和阶段耗时；`cache/` 保存每版本索引及构建时间；`budget.json` 分列优化、预检、QA、judge 的实际 usage。历史基线投入不计入本次新增预算，需在论文总投入中另报。尚未自动核算美元、CPU 和存储费用，也未实现四组消融、独立 RSI 重复及分组置信区间。
+
+新增 RSI 文件使用独立 manifest，不改原执行器的代码签名；候选代码各自签名，不能把不同版本结果混合汇总。完成后 `frozen.json` 指向最终代码目录，不会自动合入原始 RISE。
+
 ## 发布范围与许可
 
 以本目录作为 GitHub 仓库根目录，只提交代码、依赖清单、judge prompt、凭据示例、必要数据 ID／校验值和本 README。`.gitignore` 排除语料、索引、运行结果、trace、虚拟环境、二进制和个人凭据。
