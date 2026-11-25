@@ -121,41 +121,58 @@ nohup .venv/bin/python -u -B adapters/experiment/launch.py --plan plans/enterpri
 
 ## RSI 最小实验闭环
 
-`adapters/rsi/run.py` 提供一个持续负责分析、诊断、修复和复盘的优化 agent：查询原始事实 → 标注证据要求 → 保存机制诊断 → 比较成本与风险 → 提交代码 → 配对验证 → 接受或拒绝。没有预装优化措施，不修改当前工作树；所有候选保存在独立目录。第一版逐项验证，不做多 agent、候选组合或前缀续跑。
+`adapters/rsi/run.py` 提供一个持续负责分析、诊断、修复和复盘的优化 agent。系统准备工作目录，agent 通过 Bash 读取原始轨迹、编写分析脚本、直接编辑 RISE，再调用既有评估器验证。没有预装优化措施，不修改仓库工作树；候选保存在独立目录。不做多 agent、候选组合或前缀续跑。
 
-两项方法对应四个工具，而不是四个独立 agent：
+接口简化为三个工具：通用的 **`bash`**、专用计算工具 **`metrics`**、触发既有验证流程的 **`evaluate`**。移除了 `query/annotate/diagnose/submit`、强制引用登记、唯一片段校验、诊断 ID 和精确 old/new 替换协议。
 
-| 方法 | 代码与 agent 接口 | 约束 |
+| 方法 | 实现 | 边界 |
 | --- | --- | --- |
-| **可查询、可核验的证据反馈** | `feedback.py` 的 `query`、`annotate`；按需读取题目、原始事件、文档、证据状态 | 原文哈希和区间由程序核验；充分性、覆盖范围和必要性仍是模型判断，不升级为事实 |
-| **证据约束下的成本归因与选择** | `feedback.py` 的 `cost`、`diagnose`，`run.py` 的诊断比较和 `submit` | 先登记依据与机制，再选择改动；程序核验成本范围，agent 判断优先级，最后用实测而非估计负担决定接受 |
+| **可查询、可核验的证据反馈** | Bash 直接查看只读原始文件；`feedback.py` 从请求和工作区计算 S1–S6 观测 | 可回查事实，但不强制核验模型填写的引用；语义充分性、覆盖范围和必要性仍是模型判断 |
+| **证据约束下的成本归因与选择** | `metrics` 提供实际 usage、逐要求驻留和内容携带账；agent 结合证据必要性选择改动，`evaluate` 给出配对结果 | 不再用登记流程强制“证据约束”；由提示词引导归因，最终用实测决定接受，不能把相关成本直接当作可省成本 |
 
-`prompts.py` 保存统一提示词与工具 schema，不包含已知有效的具体优化配方。`diagnose` 必填观察、假设、反证、未知项、预期可观测变化、风险，以及每题的原始引用、相关请求、内容 ID 和必要性判断。`query(kind="diagnoses")` 并列展示影响范围、相关请求实际 Token、所选内容携带量、必要性判断、共同开发集的验证成本参考及历史实测结果；不把相关成本自动当成收益分数。`submit` 必须引用当前版本的诊断并说明选择理由；标注变化后须重新诊断。验证返回开发题逐题得分／Token 变化和本候选验证投入，失败候选的开发轨迹也可用 `version` 查询、标注和复盘。
+`prompts.py` 保存统一提示词、工具 schema 和工作目录说明，不包含已知有效的具体优化配方。诊断可以写在普通笔记中，不必填表；出现可检验的机制后即可编辑代码并评估，不要求先穷尽证据标注。
+
+运行时 Bash 看到的 `/workspace`：
+
+```text
+code/src/rise/       可直接编辑的代码副本（四个运行时文件）
+reference/          当前已接受版本的完整代码，只读，可比较或恢复
+data/               开发题、gold、成本排序、候选结果及 RSI 投入，只读
+traces/<version>/   开发题原始记录与全部 attempt，只读挂载，不做摘要转述
+documents.jsonl     文档 ID 到原始文件的映射，只读
+corpus/             完整固定语料，只读
+notes/              agent 自行编写脚本、提取数据、记录分析
+metrics/            程序计算的完整证据／成本 JSON，只读
+shell/              Bash 完整输出与执行记录，只读
+logs/               候选开发阶段的运行日志，只读
+```
+
+`metrics()` 返回开发题成本概览；`metrics(qid=...)` 计算单题六态和成本，返回概要及完整 JSON 路径，长结果交给 Bash 自行过滤。默认跟踪已知 gold 来源，不假定它们涵盖全部等价证据。需要事实级分析时，可自行写 `notes/evidence.json` 并传 `evidence_file`，格式见工作目录 README；它是可选分析输入，不是提交门槛。S4 无片段时标为未评估，S5 无语义判断时为 unknown。`evaluate(summary=...)` 只需简述机制、预期效果及选择理由，直接冻结当前文件；拒绝后保留编辑内容供继续修改。
 
 **前提**：已有当前代码和依赖版本下完成评分的基线 campaign，保留 prepared 数据、`corpus.parquet` 和完整 trace。准备一个 JSON 划分文件，包含非空的 `dev`、`selection`、`test` 三个题号数组，恰好覆盖基线计划的全部题目；可增加 `groups`（题号到事件组的映射）。程序拒绝题号重叠、相同问题、共享标注来源或显式事件组跨集合；未标注的事件关联仍需人工检查。人工深入分析过的问题应归入开发集，建议先用 20–30 道开发题。
 
 ```bash
 # 离线初始化：复用原始基线结果，不调用 API。
 .venv/bin/python -B adapters/rsi/run.py init \
-  --plan plans/enterprise_511959_500qa.json --split plans/rsi_split.json \
-  --out runs/rsi_pilot --max-candidates 3 --max-total-tokens 5000000
+  --plan plans/enterprise_10970_stratified100.json --split plans/rsi_split.json \
+  --out runs/rsi_bash_pilot --max-calls 150 --max-candidates 3 --max-total-tokens 0
 
-# 离线检查开发题反馈；其他查询为 case/event/source/evidence/cost/code/diagnoses。
-.venv/bin/python -B adapters/rsi/run.py query --root runs/rsi_pilot --kind cases
+# 离线检查概览；加 --qid <开发题ID> 计算单题六态与成本。
+.venv/bin/python -B adapters/rsi/run.py metrics --root runs/rsi_bash_pilot
 
 # 以下两条均会真实调用 API；仅在 Linux + bubblewrap 环境执行。
-.venv/bin/python -B adapters/rsi/run.py run --root runs/rsi_pilot --execute
-.venv/bin/python -B adapters/rsi/run.py test --root runs/rsi_pilot --execute
+.venv/bin/python -B adapters/rsi/run.py run --root runs/rsi_bash_pilot --execute
+.venv/bin/python -B adapters/rsi/run.py test --root runs/rsi_bash_pilot --execute
 ```
 
 - **模型与编辑范围**：问答及 judge 继续使用原基线模型。初始化时用 `--optimizer-model` 和 `--optimizer-response-model` 单独指定优化模型；默认与基线相同，不自动调用强模型。可修改 `agent.py`、`tools.py`、`rise_agent.py`、`retrieval.py`；评分器、预算配置、日志和 RSI 控制器不开放编辑。适配器中固定的参数不属于本版编辑范围。
-- **证据与成本**：查询分页返回原文；标注核验唯一原文片段及哈希，区分替代来源和联合支持。S1–S4 是从工作区及实际请求得到的保守观测，不能将未匹配到原文等同于事实不存在；充分性和采纳需要语义判断。逐请求记录实际 usage、事实可见变化与各项要求的状态驻留成本；不同要求的驻留账重叠，不能相加。携带账记录工具操作、首末可见请求、命中片段及物理重复，包含重试；不强行关联无法对应的工具事件。`cl100k_base` 仅作 Token 估计，不冒充 DeepSeek 账单，缺失 tokenizer 时只报告字符量。携带范围仅覆盖工具消息，不能代替整题成本；命中或未命中标注都不能自动证明内容的必要性。
+- **证据与成本**：S1 已知来源未观察到可达，S2 可达，S3 来源路径可见，S4 所提供的片段可见，S5 证据充分性判断，S6 最终答案状态。S1–S4 是从工作区及实际请求得到的保守观测；不能将未匹配到原文等同于事实不存在，也不核验所填片段是否确实属于来源。逐请求记录实际 usage、事实可见变化与各项要求的状态驻留成本；不同要求的驻留账重叠，不能相加。携带账记录工具操作、首末可见请求、命中片段及物理重复，包含重试。`cl100k_base` 仅作 Token 估计，不冒充 DeepSeek 账单；不可用时只报告字符量。携带范围仅覆盖工具消息，不能代替整题成本，更不能直接代表可节省量。
 - **验证与接受**：每项候选先做语法检查，再调用既有真实预检和 QA 执行器；开发集全体问题作为共同对照，达标后才跑选择集。默认质量均值不得低于最初基线，Token 比当前版本至少降低 5%；这是小规模试运行的点估计门槛，不是统计非劣性结论。选择集仅返回聚合结果；测试单独在冻结后启动。
-- **隔离**：候选 Python 在外层 bubblewrap 中运行，仅挂载代码、去除 gold/证据/metadata 的本阶段问题、只读语料、索引、输出及 API 凭据。真实评分在宿主执行，评分日志不挂载给候选，内部 bash 继续使用原沙箱。跨挂载点无法硬链接时，仅对召回文件做字节一致的复制；这会增加文件 I/O，延迟不能视为与原基线完全同环境。网络为 API 保留；这不是对恶意 Python 的完备安全审计，仍应检查候选代码有无硬编码或评估特判。
-- **预算与恢复**：默认最多 30 次优化请求、3 项候选，连续两项未接受即停止。总 Token 阈值在请求和评估阶段之间检查，不会中断正在运行的阶段，因此可能超出一个阶段的费用；请给最终测试预留额度。失败请求没有 usage 时记为未知并停止，不按零计费；不自动重抽答错题。用相同命令恢复，签名漂移会拒绝，失败现场和 `.building` 不自动清理。
-- **产物**：`diagnoses/` 保存冻结的机制诊断、引用哈希、标注快照及成本范围；`versions/*/proposal.json`、`decision.json` 和隔离代码保存候选、选择理由、配对结果与验证投入；`annotations/` 保留标注版本；`evaluations/` 保存运行、宿主评分和阶段耗时；`cache/` 保存每版本索引及构建时间；`budget.json` 分列优化、预检、QA、judge 的实际 usage。历史基线投入不计入本次新增预算，需在论文总投入中另报。尚未自动核算美元、CPU 和存储费用，也未实现四组消融、独立 RSI 重复及分组置信区间。
+- **隔离**：优化 agent 的 Bash 无网络、无凭据，只能写工作目录，不能读取选择／测试题；默认超时 120 秒，可通过工具参数调整。完整输出落盘，返回前 16,000 字符供后续自行筛选。候选 QA 仍在另一层 bubblewrap 中执行，仅挂载代码、去除 gold/证据/metadata 的本阶段问题、只读语料、索引、输出及 API 凭据；网络为 API 保留。真实评分在宿主执行，评分日志不挂载给候选，内部 bash 继续使用原沙箱。跨挂载点无法硬链接时，对召回文件做字节一致的复制，会增加 I/O；延迟不能视为与原基线完全同环境。这不是对恶意 Python 的完备安全审计，仍应检查候选代码有无硬编码或评估特判。
+- **预算与恢复**：默认最多 150 次优化请求、3 项候选，连续两项未接受即停止；默认 `--max-total-tokens 0`，不设本地总 Token 上限，供应商报错不自动重试。仍保留 usage 审计，失败请求缺少 usage 时记为未知并停止，不按零计费。设置正数 Token 阈值时只在请求和评估阶段间检查，可能超出一个阶段的费用。Bash 超时会清理子进程；已完成的调用恢复时返回原记录，中断的调用不会自动重放。语法错误或无代码变化不消耗候选名额。签名漂移会拒绝，失败现场和 `.building` 不自动清理。
+- **产物**：`workspace/` 保存代码与自由分析内容；`workspace_data/` 保存只读挂载的开发题概览；`metrics/` 保存完整计算及其可选分析输入；`shell/` 保存命令和输出。`versions/*/proposal.json`、`decision.json` 和隔离代码保存候选说明、配对结果与验证投入；`evaluations/` 保存运行、宿主评分和阶段耗时；`cache/` 保存每版本索引及构建时间；`budget.json` 分列优化、预检、QA、judge 的实际 usage。历史基线投入不计入新增预算，需另报。尚未自动核算美元、CPU 和存储费用，也未实现消融、独立 RSI 重复及置信区间。
 
-新增 RSI 文件使用独立 manifest，不改原执行器的代码签名；候选代码各自签名，不能把不同版本结果混合汇总。完成后 `frozen.json` 指向最终代码目录，不会自动合入原始 RISE。
+RSI 文件使用独立 manifest，不改原执行器的代码签名；候选代码各自签名，不能混合汇总。Bash 版必须新建 campaign，不能接管旧工具协议的优化对话；旧实验需使用其冻结控制器继续。完成后 `frozen.json` 指向最终代码目录，不会自动合入原始 RISE。
 
 ## 发布范围与许可
 

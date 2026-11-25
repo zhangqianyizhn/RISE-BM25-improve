@@ -1,4 +1,4 @@
-"""Read-only, paginated feedback over existing RISE records (no API calls)."""
+"""Evidence-state and cost calculations over original RISE records (no LLM calls)."""
 from __future__ import annotations
 
 from collections import Counter
@@ -27,16 +27,6 @@ def events(path):
             for line, text in enumerate(stream, 1):
                 if text.strip():
                     yield line, json.loads(text)
-
-
-def page(value, offset=0, limit=6000):
-    """Offsets count Unicode characters, including for serialized JSON."""
-    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 12000:
-        raise ValueError('Use offset >= 0 and limit between 1 and 12000')
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
-    end = min(len(text), offset + limit)
-    return dict(text=text[offset:end], offset=offset, total_chars=len(text),
-                next_offset=end if end < len(text) else None, sha256=digest(text))
 
 
 def checked_results(dataset, ids, signature):
@@ -106,11 +96,11 @@ def audit_usage(root):
 
 
 class Feedback:
-    def __init__(self, dataset, source, questions, signature, annotations, scoring=None):
+    def __init__(self, dataset, source, questions, signature, scoring=None):
         self.dataset, self.source = Path(dataset), Path(source)
         self.scoring = Path(scoring) if scoring else self.dataset
         self.questions = {q['id']: q for q in questions}
-        self.signature, self.annotations = signature, Path(annotations)
+        self.signature = signature
         self.documents = {d['id']: d for _, d in events(self.source / 'documents.jsonl')}
 
     def attempt(self, qid):
@@ -124,52 +114,25 @@ class Feedback:
             raise ValueError('Attempt outside dataset')
         return path
 
-    def document(self, doc_id):
-        d = self.documents[doc_id]
-        path = (self.source / d['path']).resolve()
-        if not path.is_relative_to((self.source / 'corpus').resolve()) or sha(path) != d['sha256']:
-            raise ValueError('Source changed or escaped corpus')
-        return path.read_bytes().decode('utf-8'), d
-
     def overview(self):
         values = checked_results(self.scoring, self.questions, self.signature)
         return [dict(id=k, **v) for k, v in sorted(values.items(), key=lambda x: -x[1]['tokens'])]
 
-    def annotation(self, qid):
-        path = self.annotations / (safe_id(qid) + '.json')
-        return read_json(path) if path.exists() else dict(requirements=[], coverage_complete=False)
-
-    def validate_annotation(self, qid, value):
+    def evidence(self, qid, annotation=None):
         attempt = self.attempt(qid)
-        requirements = value['requirements']
-        if not requirements or len(requirements) > 30 or type(value['coverage_complete']) is not bool:
-            raise ValueError('Supply 1–30 requirements and a boolean coverage_complete judgment')
-        for requirement in requirements:
-            if not requirement['fact'].strip() or not requirement['alternatives']:
-                raise ValueError('Each requirement needs a fact and alternative support groups')
+        # Optional analysis input, not an annotation/diagnosis admission gate.
+        # Without quotes, track known sources only; S4 and S5 stay unassessed.
+        annotation = json.loads(json.dumps(annotation or {}))
+        if 'requirements' not in annotation:
+            annotation['requirements'] = [dict(fact='Known source: ' + doc_id,
+                alternatives=[[dict(doc_id=doc_id, quote='')]])
+                for doc_id in self.questions[qid].get('document_ids', [])]
+        for requirement in annotation['requirements']:
             for group in requirement['alternatives']:
-                if not group:
-                    raise ValueError('An alternative must contain supporting spans')
                 for span in group:
-                    text, d = self.document(span['doc_id'])
-                    quote = span['quote']
-                    if not isinstance(quote, str) or not quote or text.count(quote) != 1:
-                        raise ValueError('Quote must occur exactly once; include enough surrounding text')
-                    start = text.index(quote)
-                    span.update(source_hash=d['sha256'], start=start, end=start + len(quote),
-                                span_id=digest([d['sha256'], start, quote])[:24])
-        if value.get('sufficiency'):
-            requests = {e['http_id'] for _, e in events(attempt / 'http.jsonl') if e['event'] == 'request'}
-            for judgment in value['sufficiency']:
-                if (judgment['http_id'] not in requests or not judgment['reason'].strip()
-                        or judgment['verdict'] not in {'sufficient', 'insufficient', 'unknown'}):
-                    raise ValueError('Sufficiency needs an actual request ID, verdict and reason')
-        return dict(**value, case_id=qid, trace_signature=self.signature,
-                    basis='optimizer semantic judgment; spans verified mechanically; not ground truth')
-
-    def evidence(self, qid):
-        attempt = self.attempt(qid)
-        annotation = self.annotation(qid)
+                    span.setdefault('quote', '')
+                    span['span_id'] = digest([span['doc_id'], span['quote']])[:24]
+        annotation['basis'] = 'Analysis supplied by optimizer; source quotes and coverage are not certified'
         # Workspace snapshots have call IDs, but old logs have no request IDs.
         # Join them to tool returns, then bound by actual request timestamps.
         returns = {e['call_id']: e['timestamp'] for _, e in events(attempt / 'tools.jsonl')
@@ -194,36 +157,39 @@ class Feedback:
                     branch = []
                     for span in group:
                         rel = str(Path(self.documents[span['doc_id']]['path']).relative_to('corpus'))
-                        state = ('S4' if any(span['quote'] in t for t in visible) else
+                        state = ('S4' if span['quote'] and any(span['quote'] in t for t in visible) else
                                  'S3' if any(rel in t for t in visible) else
                                  'S2' if rel in reachable else
                                  'S1' if (attempt / 'workspace.jsonl').exists() else 'unknown')
-                        branch.append(dict(span_id=span['span_id'], state=state))
+                        branch.append(dict(span_id=span['span_id'], state=state,
+                                           quote_supplied=bool(span['quote'])))
                     alternatives.append(branch)
                 states.append(dict(fact=requirement['fact'], alternatives=alternatives,
-                                   visible=any(all(s['state'] == 'S4' for s in g) for g in alternatives)))
+                                   visible=any(g and all(s['state'] == 'S4' for s in g) for g in alternatives)))
             observations.append(dict(http_id=event['http_id'], ref=f'http.jsonl:{line}', requirements=states,
                 sufficiency=dict(judgments.get(event['http_id'], {'verdict': 'unknown'}),
                                  basis='optimizer judgment, not a deterministic state'),
                 all_annotated_requirements_visible=bool(states) and all(s['visible'] for s in states)))
+        result = read_json(attempt / 'result.json')
         return dict(annotation=annotation, observations=observations,
-                    terminal=dict(state='S6', answer=read_json(attempt / 'result.json').get('answer')),
+                    terminal=dict(state='S6', status=result.get('status'), answer=result.get('answer')),
                     limitations=['S1 concerns known sources only', 'S3 is a literal path mention',
-                                 'S4 verifies quote visibility, not adoption or full semantic sufficiency',
+                                 'S4 checks supplied quote visibility, not its source validity, adoption or sufficiency',
+                                 'Without supplied quotes S4 is unassessed, not evidence of missing facts',
                                  'States are observed lower bounds; absent exact matches do not prove absent evidence',
                                  'S5 and source adoption remain unknown without semantic review'])
 
-    def cost(self, qid):
+    def cost(self, qid, evidence=None):
         attempt = self.attempt(qid)
         try:
             import tiktoken
             encoding = tiktoken.get_encoding('cl100k_base')
-        except ImportError:
+        except (ImportError, OSError):
             encoding = None
-        evidence = self.evidence(qid)
+        evidence = evidence if evidence is not None else self.evidence(qid)
         observations = {o['http_id']: o for o in evidence['observations']}
         spans = {s['span_id']: s['quote'] for r in evidence['annotation']['requirements']
-                 for group in r['alternatives'] for s in group}
+                 for group in r['alternatives'] for s in group if s['quote']}
         responses = {e['http_id']: e.get('usage') for _, e in events(attempt / 'http.jsonl') if e['event'] == 'response'}
         residence = [dict(fact=r['fact'], states={}) for r in evidence['annotation']['requirements']]
         items, requests, previously_visible = {}, [], set()
@@ -261,8 +227,8 @@ class Feedback:
             for i, requirement in enumerate(observation['requirements']):
                 # AND spans use their lowest observed boundary; OR alternatives
                 # use their highest. Each requirement has its own overlapping bill.
-                rank = max(min(int(s['state'][1:]) if s['state'] != 'unknown' else 0 for s in group)
-                           for group in requirement['alternatives'])
+                rank = max((min((int(s['state'][1:]) if s['state'] != 'unknown' else 0 for s in group), default=0)
+                            for group in requirement['alternatives']), default=0)
                 bucket = residence[i]['states'].setdefault('S' + str(rank) if rank else 'unknown',
                     dict(requests=0, known_total_tokens=0, unknown_usage_requests=0))
                 bucket['requests'] += 1
@@ -289,103 +255,24 @@ class Feedback:
                                  'No literal progress or matched span does not establish usefulness or necessity',
                                  'Carrying burden is not removable cost; no dollar estimate'])
 
-    def diagnose(self, value):
-        """Ground a mechanism and its cost scope; never certify its causal claim."""
-        for name in ('observations', 'hypothesis', 'counterevidence', 'unknowns', 'expected_change', 'risks'):
-            if not value[name].strip():
-                raise ValueError('Diagnosis needs ' + name + '; explicitly state unknown when unresolved')
-        cases = value['cases']
-        if not cases or len({c['qid'] for c in cases}) != len(cases):
-            raise ValueError('Diagnosis needs distinct development cases')
-        grounded, tokens, unknown, burden = [], 0, 0, 0
-        for case in cases:
-            annotation = self.annotation(case['qid'])
-            if not annotation['requirements']:
-                raise ValueError('Annotate cited development evidence before diagnosis')
-            if not case['evidence_refs'] or not case['cost_http_ids']:
-                raise ValueError('Cite original event lines and request IDs from the cost query')
-            refs = []
-            for ref in case['evidence_refs']:
-                if ':' not in ref:
-                    raise ValueError('Evidence reference must name a trace line')
-                event = self.query('event', qid=case['qid'], ref=ref)
-                refs.append(dict(ref=ref, event_hash=event['sha256']))
-            if (case['necessity'] not in {'necessary', 'avoidable', 'mixed', 'unknown'}
-                    or not case['reason'].strip()):
-                raise ValueError('Cost necessity needs a judgment and its evidence-based reason')
-            cost = self.cost(case['qid'])
-            requests = {r['http_id']: r for r in cost['requests']}
-            content = {c['occurrence_id']: c for c in cost['content']}
-            ids, content_ids = set(case['cost_http_ids']), set(case['content_ids'])
-            if not ids <= requests.keys() or not content_ids <= content.keys():
-                raise ValueError('Use actual request and content IDs from this case cost query')
-            if any(not ids.intersection(content[k]['http_ids']) for k in content_ids):
-                raise ValueError('Selected content must occur in the selected requests')
-            selected = [requests[k] for k in sorted(ids)]
-            amount = sum(r['usage']['total_tokens'] for r in selected if r['usage'])
-            missing = sum(r['usage'] is None for r in selected)
-            carried = sum(content[k]['chars'] * len(ids.intersection(content[k]['http_ids'])) for k in content_ids)
-            matched = sorted({span for k in content_ids for span in content[k]['matched_span_ids']})
-            grounded.append(dict(**case, verified_refs=refs, annotation_hash=digest(annotation),
-                cost_scope=dict(known_associated_tokens=amount, unknown_usage_requests=missing,
-                                selected_carried_chars=carried, matched_span_ids=matched),
-                requests=selected, annotation=annotation))
-            tokens, unknown, burden = tokens + amount, unknown + missing, burden + carried
-        return dict(claim=value, cases=grounded, trace_signature=self.signature,
-            metrics=dict(affected_cases=len(cases), known_associated_tokens=tokens,
-                         unknown_usage_requests=unknown, selected_carried_chars=burden),
-            basis='References and cost scope verified; mechanism and necessity are optimizer judgments. '
-                  'Associated tokens and carrying are not savings; compare paired QA results to test the claim.')
-
-    def query(self, kind, qid=None, ref=None, offset=0, limit=6000):
-        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 12000:
-            raise ValueError('Use offset >= 0 and limit between 1 and 12000')
-        if kind == 'cases':
-            value = self.overview()
-        elif kind == 'source':
-            value, _ = self.document(ref)
-        elif kind == 'case':
-            self.attempt(qid)
-            value = self.questions[qid]
-        elif kind == 'evidence':
-            value = self.evidence(qid)
-            if ref:
-                value = next((o for o in value['observations'] if o['http_id'] == ref), None)
-                if value is None:
-                    raise ValueError('Unknown evidence request ID')
-        elif kind == 'cost':
-            value = self.cost(qid)
-            if ref:
-                value = next((v for v in value['requests'] + value['content']
-                              if v.get('http_id', v.get('occurrence_id')) == ref), None)
-                if value is None:
-                    raise ValueError('Unknown cost request or content ID')
-        elif kind == 'event':
-            name, _, number = ref.partition(':')
-            if name not in {'http.jsonl', 'tools.jsonl', 'retrieval.jsonl', 'workspace.jsonl', 'native_full.json'}:
-                raise ValueError('Unknown trace file')
-            path = self.attempt(qid) / name
-            if number:
-                value = next(e for line, e in events(path) if line == int(number))
-            elif name.endswith('.json'):
-                value = read_json(path)
-            else:
-                # Preserve original text and supply actual line references, without
-                # building the whole trace or asking the optimizer to count lines.
-                chunk, skip = '', offset
-                with path.open(encoding='utf-8') as stream:
-                    for line, text in enumerate(stream, 1):
-                        text = f'{name}:{line} ' + text
-                        if skip >= len(text):
-                            skip -= len(text)
-                            continue
-                        chunk += text[skip:skip + limit + 1 - len(chunk)]
-                        skip = 0
-                        if len(chunk) > limit:
-                            break
-                return dict(text=chunk[:limit], offset=offset,
-                            next_offset=offset + limit if len(chunk) > limit else None,
-                            ref=ref, trace_signature=self.signature)
-        else:
-            raise ValueError('Unknown query kind')
-        return dict(page(value, offset, limit), ref=ref, trace_signature=self.signature)
+    def metrics(self, qid, annotation=None):
+        evidence = self.evidence(qid, annotation)
+        cost = self.cost(qid, evidence)
+        counts = Counter()
+        for requirement in cost['requirement_residence']:
+            for state, value in requirement['states'].items():
+                counts[state] += value['requests']
+        sufficiency = Counter(o['sufficiency']['verdict'] for o in evidence['observations'])
+        quoted = sum(any(g and all(s['quote'] for s in g) for g in r['alternatives'])
+                     for r in evidence['annotation']['requirements'])
+        summary = dict(qid=qid, actual_accepted_qa=cost['actual_accepted_qa'],
+            all_attempts=cost['all_attempts'],
+            states={**{s: dict(requirement_requests=counts[s]) for s in ('S1', 'S2', 'S3', 'S4')},
+                    'S5': dict(request_judgments=dict(sufficiency), basis='optimizer judgment'),
+                    'S6': dict(status=evidence['terminal']['status'])},
+            requirements=len(evidence['annotation']['requirements']), quoted_requirements=quoted,
+            unknown_requirement_requests=counts['unknown'],
+            carried_tool_chars=sum(c['carried_chars'] for c in cost['content']),
+            note='S1–S4 count overlapping requirement/request observations, not disjoint turns or savings; '
+                 'S4 is unassessed for requirements without quotes; S5 defaults to unknown')
+        return dict(summary=summary, evidence=evidence, cost=cost)

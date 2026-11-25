@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Small RSI controller: frozen baseline → query/edit → paired evaluation.
+"""Small RSI controller: Bash workspace → evidence/cost metrics → paired evaluation.
 
-init/query are offline. run/test require --execute and Linux bubblewrap.
+init/metrics are offline. run/test require --execute and Linux bubblewrap.
 Candidate Python is never imported into the controller process.
 """
 from __future__ import annotations
@@ -9,16 +9,18 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from types import SimpleNamespace
 
-from feedback import Feedback, audit_usage, checked_results, comparison, events, page, sha
+from feedback import Feedback, audit_usage, checked_results, comparison, events, sha
 from common import ROOT, MODEL, RESPONSE_MODEL, atomic_json, append, code_manifest, digest, now, read_json, safe_id
-from prompts import SYSTEM, TOOLS
+from prompts import SYSTEM, TOOLS, WORKSPACE_GUIDE
 
 EDITABLE = ['src/rise/agent.py', 'src/rise/tools.py', 'src/rise/rise_agent.py', 'src/rise/retrieval.py']
 
@@ -60,19 +62,14 @@ def validate_split(questions, split):
             owners[key] = assignment[q['id']]
 
 
-def apply_edits(parent, destination, edits):
-    """Stage an isolated candidate; syntax-check without importing generated code."""
-    if not edits:
-        raise ValueError('At least one edit is required')
+def snapshot(parent, destination, workspace):
+    """Freeze edited files directly; no old/new strings or diagnosis prerequisites."""
     staged = {}
-    for edit in edits:
-        name = edit['path']
-        if name not in EDITABLE:
-            raise ValueError('Not an editable runtime module: ' + name)
-        text = staged.get(name, (Path(parent) / name).read_text())
-        if not edit['old'] or text.count(edit['old']) != 1:
-            raise ValueError('Old text must match exactly once: ' + name)
-        text = text.replace(edit['old'], edit['new'], 1)
+    for name in EDITABLE:
+        path = (workspace / 'code' / name).resolve()
+        if not path.is_relative_to(workspace / 'code'):
+            raise ValueError('Edited source must stay inside workspace/code: ' + name)
+        text = path.read_text()
         compile(text, name, 'exec')
         staged[name] = text
     if all(text == (Path(parent) / name).read_text() for name, text in staged.items()):
@@ -82,6 +79,27 @@ def apply_edits(parent, destination, edits):
     for name, text in staged.items():
         (temp / name).write_text(text)
     temp.rename(destination)
+
+
+def sandbox_base(network=False):
+    """Common OS mounts; callers add only the data and writable paths they own."""
+    command = [shutil.which('bwrap'), '--die-with-parent', '--unshare-all', '--clearenv']
+    if network:
+        command += ['--share-net']
+    for name in ('/usr', '/bin', '/sbin', '/lib', '/lib64'):
+        path = Path(name)
+        if path.is_symlink():
+            command += ['--symlink', str(path.readlink()), name]
+        elif path.exists():
+            command += ['--ro-bind', name, name]
+    base = Path(sys.base_prefix).resolve()
+    if not base.is_relative_to('/usr'):
+        command += ['--ro-bind', str(base), str(base)]
+    command += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/etc']
+    for name in ('/etc/ssl', '/etc/ld.so.cache', '/etc/resolv.conf', '/etc/hosts'):
+        if Path(name).exists():
+            command += ['--ro-bind', name, name]
+    return command
 
 
 def initialize(args):
@@ -108,7 +126,7 @@ def initialize(args):
     validate_split(questions, split)
     checked_results(baseline / spec['name'], spec['qa_ids'], digest(effective))
     parquet = baseline / spec['name'] / 'corpus.parquet'
-    config = dict(schema=1, plan=plan, baseline=str(baseline), source=str(source),
+    config = dict(schema=2, plan=plan, baseline=str(baseline), source=str(source),
         dataset=spec['name'], baseline_signature=digest(effective), split=split,
         data_hashes={name: sha(source / name) for name in ('documents.jsonl', 'qa.jsonl')},
         parquet=str(parquet), parquet_sha256=sha(parquet),
@@ -130,9 +148,11 @@ def initialize(args):
     atomic_json(root / 'config.json', config)
     atomic_json(root / 'state.json', dict(current='baseline', completed=[], stalls=0, calls=0,
         stopped=False, messages=[{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content':
-        json.dumps(dict(editable=EDITABLE, dev_questions=len(split['dev']),
+        json.dumps(dict(workspace='/workspace', editable=EDITABLE, dev_questions=len(split['dev']),
                         limits={k: config[k] for k in ('max_candidates', 'quality_tolerance', 'min_saving')},
-                        task='Inspect the baseline and propose a justified improvement.'), ensure_ascii=False)}]))
+                        task='Read /workspace/README.md, investigate development traces, edit code and evaluate a candidate.'), ensure_ascii=False)}]))
+    controller = Controller(root)
+    controller.prepare_workspace()
     print('Initialized', root, '(no API calls; baseline results are reused)')
 
 
@@ -181,8 +201,7 @@ class Controller:
         dataset, signature = self.location(version)
         scoring = None if version == 'baseline' else self.root / 'evaluations' / version / 'dev' / 'scoring' / self.config['dataset']
         feedback = Feedback(dataset, self.config['source'],
-            [self.questions[k] for k in self.config['split']['dev']], signature,
-            self.root / 'annotations' / version, scoring=scoring)
+            [self.questions[k] for k in self.config['split']['dev']], signature, scoring=scoring)
         self._feedback = (version, feedback)
         return feedback
 
@@ -192,47 +211,115 @@ class Controller:
             dataset = self.root / 'evaluations' / version / split / 'scoring' / self.config['dataset']
         return checked_results(dataset, self.config['split'][split], signature)
 
-    def diagnosis(self, ident):
-        paths = [p for p in (self.root / 'diagnoses').glob('*.json') if p.stem == ident]
-        if not paths:
-            raise ValueError('Unknown diagnosis_id; use diagnose first')
-        record = read_json(paths[0])
-        if digest(record)[:24] != ident:
-            raise ValueError('Frozen diagnosis changed')
-        return record
+    def prepare_workspace(self):
+        workspace = self.root / 'workspace'
+        if not workspace.exists():
+            workspace.mkdir()
+            shutil.copytree(self.code(self.state['current']) / 'src', workspace / 'code/src')
+            (workspace / 'notes').mkdir()
+        # These generated files live outside the writable workspace and are
+        # mounted read-only. Original traces are mounted, not copied/summarized.
+        data = self.root / 'workspace_data'
+        data.mkdir(exist_ok=True)
+        (data / 'README.md').write_text(WORKSPACE_GUIDE)
+        write_once(data / 'questions.json', [self.questions[k] for k in self.config['split']['dev']])
+        records, mounts = [], []
+        for version in ['baseline', *self.state['completed']]:
+            dataset = (Path(self.config['baseline']) / self.config['dataset'] if version == 'baseline' else
+                       self.root / 'evaluations' / version / 'dev/run' / self.config['dataset'])
+            for qid in self.config['split']['dev']:
+                path = dataset / 'qa' / safe_id(qid)
+                if path.exists():
+                    mounts.append((path, '/workspace/traces/' + version + '/' + safe_id(qid)))
+            if version != 'baseline':
+                records.append(read_json(self.root / 'versions' / version / 'decision.json'))
+                log = self.root / 'evaluations' / version / 'dev/worker.log'
+                if log.exists():
+                    mounts.append((log, '/workspace/logs/' + version + '.log'))
+        atomic_json(data / 'cases.json', [dict(**v, trace_dir='traces/' + self.state['current'] + '/' + safe_id(v['id']))
+                                        for v in self.feedback().overview()])
+        atomic_json(data / 'status.json', dict(current=self.state['current'], candidates=records,
+            optimizer_calls=self.state['calls'], max_optimizer_calls=self.config['optimizer']['max_calls'],
+            budget=self.budget(), editable=EDITABLE))
+        mounts += [(data, '/workspace/data'), (data / 'README.md', '/workspace/README.md'),
+                   (self.code(self.state['current']), '/workspace/reference'),
+                   (Path(self.config['source']) / 'corpus', '/workspace/corpus'),
+                   (Path(self.config['source']) / 'documents.jsonl', '/workspace/documents.jsonl')]
+        # Other RISE modules remain readable/importable, but only EDITABLE files
+        # enter a candidate. Protect the other files rather than silently ignore edits.
+        mounts += [(self.code(self.state['current']) / rel, '/workspace/code/' + rel)
+                   for rel in self.config['baseline_code'] if rel.startswith('src/') and rel not in EDITABLE]
+        for directory in ('shell', 'metrics'):
+            (self.root / directory).mkdir(exist_ok=True)
+            mounts.append((self.root / directory, '/workspace/' + directory))
+        return workspace, mounts
 
-    def query(self, kind, qid=None, ref=None, offset=0, limit=6000, version=None):
-        if kind == 'diagnoses':
-            if ref:
-                return page(self.diagnosis(ref), offset, limit)
-            outcomes = {}
-            for path in (self.root / 'versions').glob('*/proposal.json'):
-                proposal = read_json(path)
-                decision = path.parent / 'decision.json'
-                outcomes.setdefault(proposal['proposal']['diagnosis_id'], []).append(
-                    read_json(decision) if decision.exists() else dict(version=path.parent.name, status='pending'))
-            records = []
-            for path in sorted((self.root / 'diagnoses').glob('*.json')):
-                d = self.diagnosis(path.stem)
-                records.append(dict(diagnosis_id=path.stem, version=d['version'],
-                    needs_regrounding=d['version'] != self.state['current'], hypothesis=d['claim']['hypothesis'],
-                    expected_change=d['claim']['expected_change'], risks=d['claim']['risks'], metrics=d['metrics'],
-                    necessity_judgments=[dict(qid=c['qid'], necessity=c['necessity'], reason=c['reason'],
-                                             matched_span_ids=c['cost_scope']['matched_span_ids']) for c in d['cases']],
-                    outcomes=outcomes.get(path.stem, [])))
-            value = dict(current_version=self.state['current'],
-                pilot_qa_tokens_reference=sum(v['tokens'] for v in self.results(self.state['current'], 'dev').values()),
-                validation_note='Common dev QA reference, not a forecast. Add preflight/judge and inspect prior actual evaluation_usage.',
-                budget=self.budget(), diagnoses=records)
-        elif kind == 'code':
-            if ref not in self.config['baseline_code']:
-                raise ValueError('Unknown source file')
-            if (version or self.state['current']) not in ['baseline', *self.state['completed']]:
-                raise ValueError('Unknown candidate version')
-            value = (self.code(version or self.state['current']) / ref).read_text()
-        else:
-            return self.feedback(version).query(kind, qid, ref, offset, limit)
-        return page(value, offset, limit)
+    def bash(self, call_id, command, timeout=120):
+        workspace, mounts = self.prepare_workspace()
+        directory = self.root / 'shell'
+        ident = safe_id(call_id)
+        receipt, started = directory / (ident + '.json'), directory / (ident + '.started.json')
+        if receipt.exists():
+            return read_json(receipt)
+        if started.exists():
+            return dict(error='Previous Bash execution was interrupted; inspect workspace before retrying with a new call',
+                        output_file='/workspace/shell/' + ident + '.txt')
+        args = sandbox_base() + ['--bind', str(workspace), '/workspace']
+        mounts += [(ROOT / '.venv', '/venv'), (self.config['plan']['rg_binary'], '/tool-bin/rg')]
+        for source, target in mounts:
+            args += ['--ro-bind', str(source), target]
+        for key, value in dict(PATH='/venv/bin:/tool-bin:/usr/bin:/bin', HOME='/tmp', LANG='C.UTF-8',
+                              PYTHONPATH='/workspace/code/src', PYTHONDONTWRITEBYTECODE='1',
+                              OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1').items():
+            args += ['--setenv', key, value]
+        args += ['--chdir', '/workspace', '--', '/bin/bash', '-c', command]
+        write_once(started, dict(command=command, timeout=timeout, timestamp=now()))
+        path = directory / (ident + '.txt')
+        timed_out = False
+        start = time.monotonic()
+        with path.open('w') as output:
+            process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=output,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+        with path.open(errors='replace') as output:
+            text = output.read(16001)
+        result = dict(returncode=process.returncode, timed_out=timed_out,
+            seconds=time.monotonic() - start, output=text[:16000], truncated=len(text) > 16000,
+            output_file='/workspace/shell/' + path.name)
+        write_once(receipt, result)
+        return result
+
+    def metrics(self, qid=None, version=None, evidence_file=None, call_id=None):
+        version = version or self.state['current']
+        feedback = self.feedback(version)
+        if qid is None:
+            return dict(version=version, cases=feedback.overview(), budget=self.budget(),
+                        note='Pass qid for S1–S6 observations and detailed cost calculations')
+        annotation = None
+        if evidence_file:
+            workspace = self.root / 'workspace'
+            path = (workspace / evidence_file.removeprefix('/workspace/')).resolve()
+            if not path.is_relative_to(workspace):
+                raise ValueError('evidence_file must be inside /workspace')
+            annotation = read_json(path)
+        result = feedback.metrics(qid, annotation)
+        directory = self.root / 'metrics' / safe_id(call_id or str(time.time_ns()))
+        for name in ('evidence', 'cost'):
+            atomic_json(directory / (name + '.json'), result[name])
+        output = dict(version=version, **result['summary'],
+                      files={name: '/workspace/metrics/' + directory.name + '/' + name + '.json'
+                             for name in ('evidence', 'cost')})
+        atomic_json(directory / 'summary.json', output)
+        return output
 
     def budget(self):
         usage = audit_usage(self.root / 'evaluations')
@@ -241,7 +328,9 @@ class Controller:
                       total_tokens=usage['total_tokens'] + optimizer['total_tokens'],
                       usage_complete=usage['usage_complete'] and optimizer['usage_complete'],
                       baseline_reused=True, baseline_cost_excluded=True,
-                      policy='Admission checked between optimizer requests and evaluation stages; one stage can exceed the token threshold')
+                      max_total_tokens=self.config['max_total_tokens'],
+                      policy=('No local token limit; usage auditing remains enabled' if self.config['max_total_tokens'] == 0 else
+                              'Admission checked between optimizer requests and evaluation stages; one stage can exceed the token threshold'))
         atomic_json(self.root / 'budget.json', report)
         return report
 
@@ -249,26 +338,12 @@ class Controller:
         budget = self.budget()
         if not budget['usage_complete']:
             raise RuntimeError('Unknown request cost; inspect HTTP audit before continuing')
-        if budget['total_tokens'] >= self.config['max_total_tokens']:
+        if self.config['max_total_tokens'] and budget['total_tokens'] >= self.config['max_total_tokens']:
             raise BudgetStop('RSI token admission budget reached')
 
     def sandbox_command(self, version, phase, stage):
         c = self.config
-        command = [shutil.which('bwrap'), '--die-with-parent', '--unshare-all', '--share-net', '--clearenv']
-        for name in ('/usr', '/bin', '/sbin', '/lib', '/lib64'):
-            p = Path(name)
-            if p.is_symlink():
-                command += ['--symlink', str(p.readlink()), name]
-            elif p.exists():
-                command += ['--ro-bind', name, name]
-        # A venv may depend on a separately installed Python outside /usr.
-        base = Path(sys.base_prefix).resolve()
-        if not base.is_relative_to('/usr'):
-            command += ['--ro-bind', str(base), str(base)]
-        command += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/etc']
-        for name in ('/etc/ssl', '/etc/ld.so.cache', '/etc/resolv.conf', '/etc/hosts'):
-            if Path(name).exists():
-                command += ['--ro-bind', name, name]
+        command = sandbox_base(network=True)
         cache = self.root / 'cache' / version
         cache.mkdir(parents=True, exist_ok=True)
         mounts = [(self.code(version), '/app', False), (ROOT / '.venv', '/app/.venv', False),
@@ -356,38 +431,27 @@ class Controller:
         self.budget()
         return values
 
-    def submit(self, call_id, proposal):
+    def submit(self, call_id, summary):
         version = safe_id(call_id)
         directory = self.root / 'versions' / version
         record = directory / 'proposal.json'
         if record.exists():
             saved = read_json(record)
-            if saved['proposal'] != proposal:
-                raise ValueError('Tool call ID reused with different edits')
             parent = saved['parent']
         else:
             if len(list((self.root / 'versions').glob('*/proposal.json'))) >= self.config['max_candidates']:
                 raise ValueError('Candidate limit reached')
             parent = self.state['current']
-            feedback = self.feedback()
-            diagnosis = self.diagnosis(proposal['diagnosis_id'])
-            if diagnosis['version'] != parent or not proposal['selection_reason'].strip():
-                raise ValueError('Ground diagnosis on the current version and explain the selection')
-            for case in diagnosis['cases']:
-                if digest(feedback.annotation(case['qid'])) != case['annotation_hash']:
-                    raise ValueError('Evidence annotation changed; record the diagnosis again')
-                for reference in case['verified_refs']:
-                    if feedback.query('event', qid=case['qid'], ref=reference['ref'])['sha256'] != reference['event_hash']:
-                        raise ValueError('Cited original event changed')
-            write_once(record, dict(parent=parent, proposal=proposal))
+            # No-change/syntax errors spend no API budget or candidate slot.
+            if not self.code(version).exists():
+                snapshot(self.code(parent), self.code(version), self.root / 'workspace')
+            write_once(record, dict(parent=parent, summary=summary))
         decision_path = directory / 'decision.json'
         if decision_path.exists():
             decision = read_json(decision_path)
         else:
             decision = dict(accepted=False, parent=parent, version=version)
             try:
-                if not self.code(version).exists():
-                    apply_edits(self.code(parent), self.code(version), proposal['edits'])
                 write_once(directory / 'code.json', manifest(self.code(version)))
                 for split in ('dev', 'selection'):
                     values = self.evaluate(version, split)
@@ -426,23 +490,12 @@ class Controller:
     def dispatch(self, call):
         args = json.loads(call['function']['arguments'])
         name = call['function']['name']
-        if name == 'query':
-            return self.query(**args)
-        if name == 'annotate':
-            feedback = self.feedback(args.pop('version', None))
-            qid = args.pop('qid')
-            value = feedback.validate_annotation(qid, args)
-            # Each revision is retained; the current pointer is for queries only.
-            write_once(feedback.annotations / 'history' / (digest(value) + '.json'), value)
-            atomic_json(feedback.annotations / (safe_id(qid) + '.json'), value)
-            return dict(saved=True, requirements=len(value['requirements']), judgment=value['basis'])
-        if name == 'diagnose':
-            record = dict(self.feedback().diagnose(args), version=self.state['current'])
-            ident = digest(record)[:24]
-            write_once(self.root / 'diagnoses' / (ident + '.json'), record)
-            return dict(diagnosis_id=ident, metrics=record['metrics'], basis=record['basis'])
-        if name == 'submit':
-            return self.submit(call['id'], args)
+        if name == 'bash':
+            return self.bash(call['id'], **args)
+        if name == 'metrics':
+            return self.metrics(call_id=call['id'], **args)
+        if name == 'evaluate':
+            return self.submit(call['id'], **args)
         raise ValueError('Unknown optimizer tool')
 
     def optimize(self):
@@ -461,8 +514,8 @@ class Controller:
                 except BudgetStop as exc:
                     state.update(stopped=True, stop_reason=str(exc))
                     break
-                except (ValueError, KeyError, StopIteration, TypeError, FileNotFoundError) as exc:
-                    result = dict(error=str(exc), effect='No successful tool result; inspect the error and revise the request')
+                except (ValueError, KeyError, TypeError, SyntaxError, OSError) as exc:
+                    result = dict(error=type(exc).__name__ + ': ' + str(exc))
                 state['messages'].append(dict(role='tool', tool_call_id=call['id'], content=json.dumps(result, ensure_ascii=False)))
                 self.save()
             if (state['stopped'] or state['calls'] >= c['optimizer']['max_calls'] or len(state['completed']) >= c['max_candidates']
@@ -527,31 +580,29 @@ def main():
     p.add_argument('--optimizer-model', default=MODEL)
     p.add_argument('--optimizer-response-model', default=RESPONSE_MODEL)
     p.add_argument('--max-candidates', type=int, default=3)
-    p.add_argument('--max-calls', type=int, default=30)
-    p.add_argument('--max-total-tokens', type=int, default=5000000)
+    p.add_argument('--max-calls', type=int, default=150)
+    p.add_argument('--max-total-tokens', type=int, default=0,
+                   help='Total token admission threshold; 0 disables the limit, not usage auditing')
     p.add_argument('--quality-tolerance', type=float, default=0)
     p.add_argument('--min-saving', type=float, default=0.05)
-    for command in ('run', 'test', 'query'):
+    for command in ('run', 'test', 'metrics'):
         p = commands.add_parser(command)
         p.add_argument('--root', type=Path, required=True)
-        if command == 'query':
-            p.add_argument('--kind', choices=['cases', 'case', 'event', 'source', 'evidence', 'cost', 'code', 'diagnoses'], required=True)
+        if command == 'metrics':
             p.add_argument('--qid')
-            p.add_argument('--ref')
             p.add_argument('--version')
-            p.add_argument('--offset', type=int, default=0)
-            p.add_argument('--limit', type=int, default=6000)
+            p.add_argument('--evidence-file', help='Optional JSON file, relative to workspace or under /workspace')
         else:
             p.add_argument('--execute', action='store_true', help='Authorize real API spending')
     args = parser.parse_args()
     if args.command == 'init':
-        if min(args.max_calls, args.max_candidates, args.max_total_tokens) < 1 or not 0 <= args.quality_tolerance <= 1 or not 0 < args.min_saving < 1:
-            parser.error('Positive budgets, quality tolerance in [0,1], and saving in (0,1) required')
+        if min(args.max_calls, args.max_candidates) < 1 or args.max_total_tokens < 0 or not 0 <= args.quality_tolerance <= 1 or not 0 < args.min_saving < 1:
+            parser.error('Positive call/candidate limits, nonnegative token threshold (0 = unlimited), quality tolerance in [0,1], and saving in (0,1) required')
         initialize(args)
         return
     controller = Controller(args.root)
-    if args.command == 'query':
-        print(json.dumps(controller.query(args.kind, args.qid, args.ref, args.offset, args.limit, args.version), ensure_ascii=False, indent=2))
+    if args.command == 'metrics':
+        print(json.dumps(controller.metrics(args.qid, args.version, args.evidence_file), ensure_ascii=False, indent=2))
         return
     if not args.execute:
         parser.error('run/test spend real API money; pass --execute explicitly')
